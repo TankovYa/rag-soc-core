@@ -1,0 +1,70 @@
+@startuml
+title RAG Platform - Context Diagram (v.0(1))
+
+!includeurl https://raw.githubusercontent.com/RicardoNiepel/C4-PlantUML/master/C4_Container.puml
+
+' Персоны
+Person(end_user, "Конечный пользователь", "Инженер или аналитик, задающий вопросы по технической документации")
+Person(ml_engineer, "ML Engineer / Data Scientist", "Разрабатывает и тестирует модели, промпты, конвертеры. Запускает эксперименты")
+Person(dev_ops, "DevOps / Platform Engineer", "Управляет инфраструктурой, CI/CD, мониторингом и безопасностью")
+Person(security_auditor, "Security Engineer", "Проверяет безопасность кода и инфраструктуры, анализирует уязвимости")
+
+' Наша система (черный ящик) - показываем два контура
+System(rag_system_prod, "RAG System (Production)", "Продуктивный контур. Обрабатывает реальные запросы пользователей")
+System(rag_system_test, "RAG System (Test/Staging)", "Тестовый контур. Используется для интеграционного тестирования, DAST-сканирования и оценки качества моделей")
+
+' Внешние системы
+System_Ext(doc_sources, "Источники документации", "Confluence, Sharepoint, Файловые хранилища (S3, NFS)")
+System_Ext(llm_provider, "LLM Provider", "Локальный кластер инференса")
+System_Ext(idp, "Identity Provider", "Корпоративный SSO (Keycloak)")
+System_Ext(git_repo, "Git Repository", "GitHub / GitLab (код, конфигурации, helm-чарты)")
+System_Ext(container_registry, "Container Registry", "Docker Hub / GitLab Registry / Harbor (образы приложений)")
+System_Ext(monitoring_stack, "Мониторинг", "Prometheus/Grafana, Loki, Jaeger (метрики, логи, трейсинг)")
+
+' Инструменты безопасности (объединенные)
+System_Ext(sec_tools, "Application Security Suite", "SAST (статический анализ - SonarQube / Checkmarx / Fortify), SCA (анализ зависимостей - Snyk / OWASP Dependency Check / Trivy), DAST (динамическое тестирование - OWASP ZAP / Burp Suite)")
+
+System_Ext(vuln_db, "Vulnerability Databases", "NVD / CVE Databases / GitHub Advisory")
+
+' Взаимодействия персон
+Rel(end_user, rag_system_prod, "Задает вопросы и получает ответы", "Web UI / API")
+Rel(ml_engineer, rag_system_test, "Запускает эксперименты, тестирует новые модели", "Admin UI / Jupyter")
+Rel(ml_engineer, rag_system_prod, "Мониторит качество ответов, просматривает историю", "Admin UI")
+Rel(dev_ops, rag_system_prod, "Наблюдает за метриками, читает логи", "Grafana / Kibana")
+Rel(dev_ops, rag_system_test, "Наблюдает за метриками, читает логи", "Grafana / Kibana")
+Rel(security_auditor, rag_system_test, "Проверяет безопасность в тестовом контуре", "Security audit")
+
+' Рантайм взаимодействия (Production)
+Rel(rag_system_prod, doc_sources, "Загружает новые документы", "REST API / Crawler")
+Rel(rag_system_prod, llm_provider, "Отправляет промпты для генерации", "REST API")
+Rel(rag_system_prod, idp, "Проверяет токены (OIDC/JWT)", "REST API")
+Rel(rag_system_prod, monitoring_stack, "Отправляет метрики и логи", "Prometheus exporter / Fluentd")
+
+' Рантайм взаимодействия (Test)
+Rel(rag_system_test, doc_sources, "Загружает тестовые документы", "REST API / Crawler")
+Rel(rag_system_test, llm_provider, "Отправляет промпты для тестов", "REST API")
+Rel(rag_system_test, idp, "Проверяет токены (OIDC/JWT)", "REST API")
+Rel(rag_system_test, monitoring_stack, "Отправляет метрики и логи", "Prometheus exporter / Fluentd")
+
+' CI/CD и процесс разработки
+Rel(dev_ops, git_repo, "Коммитит код и конфигурации", "git push")
+Rel(ml_engineer, git_repo, "Коммитит код конвертеров и промпты", "git push")
+Rel(security_auditor, git_repo, "Проверяет код, настраивает политики", "git pull / code review")
+
+' Безопасность в CI/CD
+Rel(git_repo, sec_tools, "CI/CD запускает SAST/SCA сканирование", "webhook / trigger")
+Rel(sec_tools, vuln_db, "Сверяет код/зависимости с базами уязвимостей", "API")
+Rel(sec_tools, git_repo, "Публикует результаты проверок", "commit status / MR comments")
+
+' Сборка и деплой
+Rel(git_repo, container_registry, "CI/CD собирает и пушит образы", "Docker push")
+Rel(container_registry, rag_system_test, "K8s пуллит образы для тестового контура", "Docker pull")
+Rel(container_registry, rag_system_prod, "K8s пуллит образы для продуктивного контура", "Docker pull")
+
+' DAST сканирование
+Rel(sec_tools, rag_system_test, "DAST сканирует запущенный тестовый экземпляр", "HTTP / API")
+
+' Обратная связь по безопасности
+Rel(sec_tools, security_auditor, "Отчеты об уязвимостях", "email / dashboard")
+
+@enduml

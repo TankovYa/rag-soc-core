@@ -1,0 +1,893 @@
+openapi: 3.0.3
+info:
+  title: Converter Service API
+  description: |
+    Сервис конвертации документов технической документации для RAG-платформы.
+    
+    **Назначение:**
+    - Конвертация документов из форматов HDX, HTML, XML, PDF в структурированный JSON и человекочитаемые форматы (TXT, MD)
+    - Извлечение метаданных из документов
+    - Асинхронная обработка с уведомлениями через Kafka
+    
+    **Архитектурные особенности:**
+    - Асинхронная обработка (возвращает job_id)
+    - Интеграция с Kafka для уведомлений о завершении
+    - Поддержка распределённой трассировки через W3C Trace-Context
+    - mTLS через Istio
+    - Prometheus метрики для мониторинга
+    
+    **Форматы путей:**
+    - `s3://bucket/path/to/file.hdx` — S3-совместимое хранилище
+    - `nfs://server/path/to/file.hdx` — NFS
+    - `file:///mnt/data/file.hdx` — локальная файловая система
+    - Абсолютный путь в файловой системе
+    
+  version: 1.0.0
+  contact:
+    name: RAG System Team
+    email: rag-team@company.com
+
+servers:
+  - url: https://converter.rag-system.company.com/api/v1
+    description: Production
+  - url: https://converter-test.rag-system.company.com/api/v1
+    description: Test/Staging
+
+tags:
+  - name: Conversion
+    description: Операции конвертации документов
+  - name: System
+    description: Системные endpoints (health, ready, metrics)
+
+components:
+  securitySchemes:
+    mTLS:
+      type: http
+      scheme: mutual
+      description: mTLS аутентификация через Istio
+  
+  parameters:
+    TraceParentHeader:
+      name: traceparent
+      in: header
+      required: false
+      schema:
+        type: string
+        pattern: '^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+      description: |
+        W3C Trace-Context header для распределённой трассировки.
+        Формат: `00-{trace-id}-{span-id}-{trace-flags}`
+        Пример: `00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01`
+
+  schemas:
+    # ============================================================
+    # Request/Response Models
+    # ============================================================
+    ConvertRequest:
+      type: object
+      required:
+        - source_uri
+      properties:
+        source_uri:
+          type: string
+          description: |
+            Путь к исходному документу или папке.
+            Поддерживаемые форматы: HDX, HTML, XML, PDF.
+            Может быть файлом или папкой (все поддерживаемые файлы в папке будут обработаны).
+          example: "s3://bucket/docs/platform_X.hdx"
+          minLength: 1
+          maxLength: 1024
+        output_uri:
+          type: string
+          description: |
+            Выходная директория для результатов (папка).
+            Если не указан, генерируется как `{source_uri}_output`.
+          example: "s3://bucket/output/platform_X"
+          minLength: 1
+          maxLength: 1024
+        max_articles:
+          type: integer
+          description: Обработать только первые N статей (для тестирования)
+          minimum: 1
+          maximum: 100000
+          example: 100
+        skip_extract:
+          type: boolean
+          description: Пропустить извлечение HDX и использовать сохраненные HTML файлы
+          default: false
+          example: false
+        log_level:
+          type: integer
+          description: |
+            Уровень логирования:
+            - 0: ERROR
+            - 1: WARNING
+            - 2: INFO
+            - 3: DEBUG
+          minimum: 0
+          maximum: 3
+          default: 2
+          example: 2
+
+    ConvertResponse:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+          description: Уникальный идентификатор задачи
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        source_uri:
+          type: string
+          description: Исходный путь
+          example: "s3://bucket/docs/platform_X.hdx"
+        output_uri:
+          type: string
+          nullable: true
+          description: Выходная директория
+          example: "s3://bucket/output/platform_X"
+        created_at:
+          type: string
+          format: date-time
+          description: Время создания задачи
+          example: "2024-03-25T10:00:00Z"
+
+    JobStatusResponse:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+          description: Уникальный идентификатор задачи
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        progress_percent:
+          type: integer
+          description: Прогресс выполнения в процентах (0-100)
+          minimum: 0
+          maximum: 100
+          example: 45
+        source_uri:
+          type: string
+          description: Исходный путь
+          example: "s3://bucket/docs/platform_X.hdx"
+        output_uri:
+          type: string
+          nullable: true
+          description: Выходная директория
+          example: "s3://bucket/output/platform_X"
+        error_message:
+          type: string
+          nullable: true
+          description: Сообщение об ошибке (если status = failed)
+          example: null
+        warning_message:
+          type: string
+          nullable: true
+          description: Предупреждения (например, пропущенные артефакты)
+          example: null
+        statistics:
+          $ref: '#/components/schemas/ConversionStatistics'
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Время начала обработки
+          example: "2024-03-25T10:00:05Z"
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Время завершения обработки
+          example: null
+
+    ConversionStatistics:
+      type: object
+      properties:
+        conversion:
+          $ref: '#/components/schemas/ConversionStats'
+        validation:
+          $ref: '#/components/schemas/ValidationStats'
+
+    ConversionStats:
+      type: object
+      properties:
+        total_html_files:
+          type: integer
+          description: Общее количество обработанных HTML файлов
+          example: 100
+        total_topics:
+          type: integer
+          description: Общее количество созданных тем/статей
+          example: 100
+        total_files:
+          type: integer
+          description: Общее количество созданных файлов
+          example: 500
+        txt_files:
+          type: integer
+          description: Количество созданных TXT файлов
+          example: 100
+        md_files:
+          type: integer
+          description: Количество созданных MD файлов
+          example: 100
+        metadata_files:
+          type: integer
+          description: Количество созданных JSON файлов с метаданными
+          example: 100
+        html_backups:
+          type: integer
+          description: Количество сохраненных HTML бэкапов
+          example: 100
+        images_copied:
+          type: integer
+          description: Количество скопированных изображений
+          example: 77
+        tables_processed:
+          type: integer
+          description: Количество обработанных таблиц
+          example: 47
+        internal_links_preserved:
+          type: integer
+          description: Количество сохраненных внутренних ссылок
+          example: 112
+        name_conflicts_resolved:
+          type: integer
+          description: Количество разрешенных конфликтов имен
+          example: 0
+        errors_encountered:
+          type: integer
+          description: Количество возникших ошибок
+          example: 0
+        duration_seconds:
+          type: number
+          format: float
+          description: Длительность конвертации в секундах
+          example: 126.37
+
+    ValidationStats:
+      type: object
+      properties:
+        total_articles:
+          type: integer
+          description: Общее количество статей
+          example: 100
+        valid_articles:
+          type: integer
+          description: Количество валидных статей
+          example: 100
+        articles_with_errors:
+          type: integer
+          description: Количество статей с ошибками
+          example: 0
+        articles_with_warnings:
+          type: integer
+          description: Количество статей с предупреждениями
+          example: 73
+
+    JobStatus:
+      type: string
+      enum:
+        - pending
+        - processing
+        - completed
+        - failed
+        - cancelled
+      description: |
+        Статус задачи:
+        - `pending`: Ожидает начала обработки
+        - `processing`: В процессе обработки
+        - `completed`: Успешно завершена
+        - `failed`: Завершена с ошибкой
+        - `cancelled`: Отменена пользователем
+
+    JobListResponse:
+      type: object
+      properties:
+        jobs:
+          type: array
+          items:
+            $ref: '#/components/schemas/JobSummary'
+        total:
+          type: integer
+          description: Общее количество задач
+          example: 42
+        limit:
+          type: integer
+          description: Лимит на страницу
+          example: 50
+        offset:
+          type: integer
+          description: Смещение
+          example: 0
+
+    JobSummary:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+          description: Уникальный идентификатор задачи
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        source_uri:
+          type: string
+          description: Исходный путь
+          example: "s3://bucket/docs/platform_X.hdx"
+        output_uri:
+          type: string
+          nullable: true
+          description: Выходная директория
+          example: "s3://bucket/output/platform_X"
+        created_at:
+          type: string
+          format: date-time
+          description: Время создания задачи
+          example: "2024-03-25T10:00:00Z"
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Время начала обработки
+          example: "2024-03-25T10:00:05Z"
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Время завершения обработки
+          example: "2024-03-25T10:02:05Z"
+
+    CancelResponse:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+          description: Уникальный идентификатор задачи
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        message:
+          type: string
+          description: Сообщение об отмене
+          example: "Job cancelled successfully"
+
+    # ============================================================
+    # Error Responses
+    # ============================================================
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Краткое описание ошибки
+          example: "Invalid source URI"
+        code:
+          type: string
+          description: Код ошибки
+          example: "INVALID_SOURCE_URI"
+        details:
+          type: object
+          description: Дополнительные детали ошибки
+          example:
+            field: "source_uri"
+            reason: "URI does not exist or is not accessible"
+        request_id:
+          type: string
+          description: Идентификатор запроса (для отладки)
+          example: "req_abc123"
+        trace_id:
+          type: string
+          description: Trace ID (из traceparent)
+          example: "0af7651916cd43dd8448eb211c80319c"
+
+    # ============================================================
+    # Health Check
+    # ============================================================
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+          description: |
+            - `healthy`: Все компоненты работают
+            - `degraded`: Часть компонентов недоступна, но сервис работает
+            - `unhealthy`: Сервис не может обрабатывать запросы
+          example: "healthy"
+        version:
+          type: string
+          description: Версия сервиса
+          example: "1.0.0"
+        components:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              status:
+                type: string
+                enum: [up, down]
+              latency_ms:
+                type: integer
+              error:
+                type: string
+          description: Статус зависимостей
+          example:
+            object_storage:
+              status: "up"
+              latency_ms: 15
+            kafka:
+              status: "up"
+              latency_ms: 8
+
+    ReadyResponse:
+      type: object
+      properties:
+        ready:
+          type: boolean
+          description: Готовность принимать трафик
+          example: true
+        checks:
+          type: object
+          additionalProperties:
+            type: boolean
+          description: Результаты проверок
+          example:
+            object_storage: true
+            kafka: true
+
+  responses:
+    BadRequest:
+      description: Неверный запрос (400)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Unauthorized:
+      description: Не авторизован (401)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: Ресурс не найден (404)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Conflict:
+      description: Конфликт (409)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    InternalServerError:
+      description: Внутренняя ошибка сервера (500)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ServiceUnavailable:
+      description: Сервис временно недоступен (503)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+paths:
+  # ============================================================
+  # Conversion Endpoints
+  # ============================================================
+  /convert:
+    post:
+      summary: Запуск конвертации документа или папки
+      description: |
+        Асинхронно запускает процесс конвертации.
+        
+        **Важно:**
+        - Запрос должен содержать `traceparent` header для распределённой трассировки
+        - `source_uri` может указывать как на отдельный файл, так и на папку
+        - Результаты сохраняются в `output_uri`
+        - После завершения отправляется Kafka сообщение в топик `conversion.completed` или `conversion.failed`
+        
+        **Поддерживаемые форматы:**
+        - HDX (Huawei Documentation eXtract)
+        - HTML
+        - XML
+        - PDF
+      operationId: convert
+      tags: [Conversion]
+      parameters:
+        - $ref: '#/components/parameters/TraceParentHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConvertRequest'
+            examples:
+              hdx_file:
+                summary: Конвертация HDX файла
+                value:
+                  source_uri: "s3://bucket/docs/platform_X.hdx"
+                  output_uri: "s3://bucket/output/platform_X"
+                  log_level: 2
+              folder:
+                summary: Конвертация папки с документами
+                value:
+                  source_uri: "s3://bucket/docs/platform_X/"
+                  output_uri: "s3://bucket/output/platform_X"
+                  max_articles: 100
+              test:
+                summary: Тестовый запуск (только первые 50 статей)
+                value:
+                  source_uri: "s3://bucket/docs/platform_X.hdx"
+                  output_uri: "s3://bucket/output/platform_X_test"
+                  max_articles: 50
+                  log_level: 3
+      responses:
+        '202':
+          description: Задача принята в обработку
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConvertResponse'
+              example:
+                job_id: "550e8400-e29b-41d4-a716-446655440000"
+                status: "pending"
+                source_uri: "s3://bucket/docs/platform_X.hdx"
+                output_uri: "s3://bucket/output/platform_X"
+                created_at: "2024-03-25T10:00:00Z"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Задача с таким source_uri уже существует
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "Job already exists for this source_uri"
+                code: "JOB_ALREADY_EXISTS"
+                details:
+                  source_uri: "s3://bucket/docs/platform_X.hdx"
+                  existing_job_id: "550e8400-e29b-41d4-a716-446655440000"
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    get:
+      summary: Получение списка задач
+      description: |
+        Возвращает список задач конвертации с фильтрацией по статусу.
+        Поддерживает пагинацию.
+      operationId: listJobs
+      tags: [Conversion]
+      parameters:
+        - $ref: '#/components/parameters/TraceParentHeader'
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/JobStatus'
+          description: Фильтр по статусу
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+          description: Количество задач на страницу
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+          description: Смещение (для пагинации)
+      responses:
+        '200':
+          description: Список задач
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobListResponse'
+              example:
+                jobs:
+                  - job_id: "550e8400-e29b-41d4-a716-446655440000"
+                    status: "completed"
+                    source_uri: "s3://bucket/docs/platform_X.hdx"
+                    output_uri: "s3://bucket/output/platform_X"
+                    created_at: "2024-03-25T10:00:00Z"
+                    completed_at: "2024-03-25T10:02:05Z"
+                total: 1
+                limit: 50
+                offset: 0
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /convert/{job_id}/status:
+    get:
+      summary: Получение статуса конвертации
+      description: |
+        Возвращает детальную информацию о задаче:
+        - Текущий статус и прогресс
+        - Статистику конвертации (при завершении)
+        - Сообщения об ошибках и предупреждениях
+      operationId: getJobStatus
+      tags: [Conversion]
+      parameters:
+        - $ref: '#/components/parameters/TraceParentHeader'
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Идентификатор задачи
+      responses:
+        '200':
+          description: Статус задачи
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobStatusResponse'
+              examples:
+                processing:
+                  summary: Задача в процессе
+                  value:
+                    job_id: "550e8400-e29b-41d4-a716-446655440000"
+                    status: "processing"
+                    progress_percent: 45
+                    source_uri: "s3://bucket/docs/platform_X.hdx"
+                    output_uri: "s3://bucket/output/platform_X"
+                    error_message: null
+                    warning_message: null
+                    statistics: null
+                    started_at: "2024-03-25T10:00:05Z"
+                    completed_at: null
+                completed:
+                  summary: Задача завершена
+                  value:
+                    job_id: "550e8400-e29b-41d4-a716-446655440000"
+                    status: "completed"
+                    progress_percent: 100
+                    source_uri: "s3://bucket/docs/platform_X.hdx"
+                    output_uri: "s3://bucket/output/platform_X"
+                    error_message: null
+                    warning_message: null
+                    statistics:
+                      conversion:
+                        total_html_files: 100
+                        total_topics: 100
+                        total_files: 500
+                        txt_files: 100
+                        md_files: 100
+                        metadata_files: 100
+                        html_backups: 100
+                        images_copied: 77
+                        tables_processed: 47
+                        internal_links_preserved: 112
+                        name_conflicts_resolved: 0
+                        errors_encountered: 0
+                        duration_seconds: 126.37
+                      validation:
+                        total_articles: 100
+                        valid_articles: 100
+                        articles_with_errors: 0
+                        articles_with_warnings: 73
+                    started_at: "2024-03-25T10:00:05Z"
+                    completed_at: "2024-03-25T10:02:05Z"
+                failed:
+                  summary: Задача завершена с ошибкой
+                  value:
+                    job_id: "550e8400-e29b-41d4-a716-446655440000"
+                    status: "failed"
+                    progress_percent: 23
+                    source_uri: "s3://bucket/docs/platform_X.hdx"
+                    output_uri: "s3://bucket/output/platform_X"
+                    error_message: "Failed to parse HDX archive: invalid header"
+                    warning_message: null
+                    statistics:
+                      conversion:
+                        total_html_files: 115
+                        total_topics: 115
+                        total_files: 575
+                        txt_files: 115
+                        md_files: 115
+                        metadata_files: 115
+                        html_backups: 115
+                        images_copied: 89
+                        tables_processed: 54
+                        internal_links_preserved: 129
+                        name_conflicts_resolved: 0
+                        errors_encountered: 1
+                        duration_seconds: 28.3
+                      validation:
+                        total_articles: 115
+                        valid_articles: 115
+                        articles_with_errors: 1
+                        articles_with_warnings: 84
+                    started_at: "2024-03-25T10:00:05Z"
+                    completed_at: "2024-03-25T10:00:33Z"
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /convert/{job_id}/cancel:
+    post:
+      summary: Отмена конвертации
+      description: |
+        Отменяет выполняющуюся задачу конвертации.
+        Если задача уже завершена, возвращает 409 Conflict.
+      operationId: cancelJob
+      tags: [Conversion]
+      parameters:
+        - $ref: '#/components/parameters/TraceParentHeader'
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Идентификатор задачи
+      responses:
+        '200':
+          description: Задача отменена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelResponse'
+              example:
+                job_id: "550e8400-e29b-41d4-a716-446655440000"
+                status: "cancelled"
+                message: "Job cancelled successfully"
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Невозможно отменить задачу (уже завершена)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "Cannot cancel job: job already completed"
+                code: "JOB_ALREADY_COMPLETED"
+                details:
+                  job_id: "550e8400-e29b-41d4-a716-446655440000"
+                  status: "completed"
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # ============================================================
+  # System Endpoints
+  # ============================================================
+  /health:
+    get:
+      summary: Liveness probe
+      description: |
+        Проверка живости сервиса для Kubernetes liveness probe.
+        Возвращает 200 OK если сервис работает (процесс жив).
+        Не проверяет зависимости (для этого есть /ready).
+      operationId: health
+      tags: [System]
+      security: []
+      responses:
+        '200':
+          description: Сервис жив
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: "healthy"
+                version: "1.0.0"
+                components: {}
+        '503':
+          description: Сервис нездоров
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: "unhealthy"
+                version: "1.0.0"
+                components: {}
+
+  /ready:
+    get:
+      summary: Readiness probe
+      description: |
+        Проверка готовности сервиса для Kubernetes readiness probe.
+        Проверяет доступность всех зависимостей (Object Storage, Kafka).
+        Возвращает 200 OK только если сервис готов принимать трафик.
+      operationId: ready
+      tags: [System]
+      security: []
+      responses:
+        '200':
+          description: Сервис готов принимать трафик
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+              example:
+                ready: true
+                checks:
+                  object_storage: true
+                  kafka: true
+        '503':
+          description: Сервис не готов
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+              example:
+                ready: false
+                checks:
+                  object_storage: true
+                  kafka: false
+
+  /metrics:
+    get:
+      summary: Prometheus метрики
+      description: |
+        Возвращает метрики в формате Prometheus для мониторинга.
+        
+        **Доступные метрики:**
+        - `converter_requests_total` — общее количество запросов
+        - `converter_requests_duration_seconds` — длительность запросов (histogram)
+        - `converter_errors_total` — количество ошибок
+        - `converter_jobs_total` — общее количество созданных задач
+        - `converter_jobs_duration_seconds` — длительность выполнения задач (histogram)
+        - `converter_active_jobs` — количество активных задач (gauge)
+      operationId: metrics
+      tags: [System]
+      security: []
+      responses:
+        '200':
+          description: Метрики в формате Prometheus
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: |
+                # HELP converter_requests_total Total number of requests
+                # TYPE converter_requests_total counter
+                converter_requests_total{method="POST",endpoint="/convert"} 42
+                converter_requests_total{method="GET",endpoint="/convert/status"} 156
+                
+                # HELP converter_requests_duration_seconds Request duration in seconds
+                # TYPE converter_requests_duration_seconds histogram
+                converter_requests_duration_seconds_bucket{method="POST",le="0.1"} 35
+                converter_requests_duration_seconds_bucket{method="POST",le="0.5"} 42
+                converter_requests_duration_seconds_sum{method="POST"} 8.5
+                converter_requests_duration_seconds_count{method="POST"} 42
+                
+                # HELP converter_jobs_total Total number of conversion jobs
+                # TYPE converter_jobs_total counter
+                converter_jobs_total{status="pending"} 5
+                converter_jobs_total{status="processing"} 3
+                converter_jobs_total{status="completed"} 28
+                converter_jobs_total{status="failed"} 4
+                converter_jobs_total{status="cancelled"} 2
+                
+                # HELP converter_active_jobs Currently active jobs
+                # TYPE converter_active_jobs gauge
+                converter_active_jobs 3
+        '500':
+          description: Ошибка получения метрик
