@@ -1,0 +1,2 @@
+[console_scripts]
+hdx-converter = hdx_converter.cli:main
