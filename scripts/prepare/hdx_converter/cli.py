@@ -1,9 +1,13 @@
 import argparse
 from pathlib import Path
 import sys
+import logging
+import argparse
+import uvicorn
 from . import __version__, __author__, __year__
 from .models.config import ConverterConfig
 from .core.converter import HDXConverter
+from .api import create_app
 
 def main():
     parser = argparse.ArgumentParser(
@@ -130,5 +134,61 @@ Examples:
         print(f"Error during conversion: {e}")
         sys.exit(1)
 
+def run_api():
+    """Run API server (NEW - does not affect existing CLI mode)."""
+    import uvicorn
+    from .api import create_app
+    
+    # Парсим аргументы для API режима
+    import argparse
+    api_parser = argparse.ArgumentParser(description='Run Converter API server')
+    api_parser.add_argument('--host', default='0.0.0.0', help='Host to bind')
+    api_parser.add_argument('--port', type=int, default=8080, help='Port to bind')
+    api_parser.add_argument('--log-level', type=int, default=2, 
+                           choices=[0, 1, 2, 3],
+                           help='Log level: 0=ERROR, 1=WARNING, 2=INFO, 3=DEBUG')
+    api_parser.add_argument('--kafka-bootstrap-servers', 
+                           help='Kafka bootstrap servers (optional)')
+    api_parser.add_argument('--kafka-enabled', action='store_true',
+                           help='Enable Kafka notifications')
+    
+    args = api_parser.parse_args()
+    
+    # Настройка логгера для API
+    log_level = logging.INFO
+    if args.log_level >= 3:
+        log_level = logging.DEBUG
+    elif args.log_level >= 2:
+        log_level = logging.INFO
+    elif args.log_level >= 1:
+        log_level = logging.WARNING
+    else:
+        log_level = logging.ERROR
+    
+    logging.basicConfig(level=log_level)
+    logger = logging.getLogger("converter")
+    
+    # Создание FastAPI приложения
+    app = create_app(
+        logger=logger,
+        kafka_bootstrap_servers=args.kafka_bootstrap_servers,
+        kafka_enabled=args.kafka_enabled
+    )
+    
+    # Запуск сервера
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level="info"
+    )
+
+
 if __name__ == "__main__":
-    main()
+    # Проверяем, вызван ли скрипт в режиме API
+    if len(sys.argv) > 1 and sys.argv[1] == "api":
+        # Удаляем "api" из аргументов и передаем остальные в run_api
+        sys.argv.pop(1)
+        run_api()
+    else:
+        main()
